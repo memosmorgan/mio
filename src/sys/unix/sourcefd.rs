@@ -22,6 +22,10 @@ use crate::{event, Interest, Registry, Token};
 /// that the `SourceFd` is constructed right before a call to
 /// [`Registry::register`]. See the examples for more detail.
 ///
+/// With the `poll(2)` selector, `SourceFd` uses level-triggered readiness:
+/// events may repeat until the file descriptor is no longer ready. Unlike Mio's
+/// I/O types, `SourceFd` cannot rearm interests when an operation would block.
+///
 /// [`event::Source`]: ../event/trait.Source.html
 /// [`Poll`]: ../struct.Poll.html
 /// [`Registry::register`]: ../struct.Registry.html#method.register

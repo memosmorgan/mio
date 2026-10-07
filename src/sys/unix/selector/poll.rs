@@ -59,7 +59,7 @@ impl Selector {
         token: Token,
         interests: Interest,
     ) -> io::Result<Arc<RegistrationRecord>> {
-        self.state.register_internal(fd, token, interests)
+        self.state.register_internal(fd, token, interests, true)
     }
     }
 
@@ -162,6 +162,8 @@ struct FdData {
     /// Used to communicate with IoSourceState when we need to internally deregister
     /// based on a closed fd.
     shared_record: Arc<RegistrationRecord>,
+    /// Whether IoSourceState will rearm interests after WouldBlock.
+    rearm_on_io: bool,
 }
 
 impl SelectorState {
@@ -287,10 +289,11 @@ impl SelectorState {
                             closed_raw_fds.push(poll_fd.fd);
                         }
 
-                        // Remove the interest which just got triggered the IoSourceState's do_io
-                        // wrapper used with this selector will add back the interest using
-                        // reregister.
-                        poll_fd.events &= !poll_fd.revents;
+                        // IoSourceState rearms interests on WouldBlock. SourceFd cannot
+                        // do that, so leave its interests enabled for level-triggered events.
+                        if fd_data.rearm_on_io {
+                            poll_fd.events &= !poll_fd.revents;
+                        }
 
                         // Minor optimization to potentially avoid looping n times where n is the
                         // number of input fds (i.e. we might loop between m and n times where m is
@@ -314,7 +317,8 @@ impl SelectorState {
     }
 
     pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
-        self.register_internal(fd, token, interests).map(|_| ())
+        self.register_internal(fd, token, interests, false)
+            .map(|_| ())
     }
 
     pub fn register_internal(
@@ -322,6 +326,7 @@ impl SelectorState {
         fd: RawFd,
         token: Token,
         interests: Interest,
+        rearm_on_io: bool,
     ) -> io::Result<Arc<RegistrationRecord>> {
         #[cfg(all(debug_assertions, not(target_os = "wasi")))]
         if Some(fd) == self.notify_waker.fd() {
@@ -363,6 +368,7 @@ impl SelectorState {
                     poll_fds_index,
                     token,
                     shared_record: record.clone(),
+                    rearm_on_io,
                 },
             );
 

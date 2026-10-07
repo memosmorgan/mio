@@ -1,24 +1,109 @@
 #![cfg(all(unix, feature = "os-poll", feature = "os-ext", feature = "net"))]
 
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(not(target_os = "emscripten"))]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use mio::unix::pipe;
 #[cfg(not(target_os = "emscripten"))]
 use mio::unix::pipe::{Receiver, Sender};
+use mio::unix::{pipe, SourceFd};
 use mio::{Events, Interest, Poll, Token};
 
 mod util;
-use util::{assert_would_block, expect_events, ExpectEvent};
+use util::{assert_would_block, expect_events, expect_no_events, ExpectEvent};
 
 const RECEIVER: Token = Token(0);
 const SENDER: Token = Token(1);
 
 const DATA1: &[u8; 11] = b"Hello world";
+
+#[test]
+fn source_fd_readable_after_would_block() {
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(8);
+    let (sender, receiver) = pipe::new().unwrap();
+    let mut sender = File::from(OwnedFd::from(sender));
+    let mut receiver = File::from(OwnedFd::from(receiver));
+    let fd = receiver.as_raw_fd();
+
+    poll.registry()
+        .register(&mut SourceFd(&fd), RECEIVER, Interest::READABLE)
+        .unwrap();
+
+    for _ in 0..3 {
+        sender.write_all(b"x").unwrap();
+        expect_events(
+            &mut poll,
+            &mut events,
+            vec![ExpectEvent::new(RECEIVER, Interest::READABLE)],
+        );
+
+        let mut buf = [0; 1];
+        receiver.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"x");
+        assert_would_block(receiver.read(&mut buf));
+        expect_no_events(&mut poll, &mut events);
+    }
+
+    poll.registry().deregister(&mut SourceFd(&fd)).unwrap();
+    sender.write_all(b"x").unwrap();
+    expect_no_events(&mut poll, &mut events);
+}
+
+#[test]
+// Event ports suppress writable-only fallback events when polling with a timeout.
+#[cfg(any(not(target_os = "solaris"), mio_unsupported_force_poll_poll))]
+fn source_fd_writable_after_would_block() {
+    use std::io;
+
+    let mut poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(8);
+    let (sender, receiver) = pipe::new().unwrap();
+    let mut sender = File::from(OwnedFd::from(sender));
+    let mut receiver = File::from(OwnedFd::from(receiver));
+    let fd = sender.as_raw_fd();
+
+    poll.registry()
+        .register(&mut SourceFd(&fd), RECEIVER, Interest::READABLE)
+        .unwrap();
+    poll.registry()
+        .reregister(&mut SourceFd(&fd), SENDER, Interest::WRITABLE)
+        .unwrap();
+
+    for _ in 0..3 {
+        expect_events(
+            &mut poll,
+            &mut events,
+            vec![ExpectEvent::new(SENDER, Interest::WRITABLE)],
+        );
+
+        let mut buf = [0; 4096];
+        loop {
+            match sender.write(&buf) {
+                Ok(n) => assert!(n > 0),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected write error: {err}"),
+            }
+        }
+        expect_no_events(&mut poll, &mut events);
+
+        loop {
+            match receiver.read(&mut buf) {
+                Ok(n) => assert!(n > 0),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected read error: {err}"),
+            }
+        }
+    }
+
+    poll.registry().deregister(&mut SourceFd(&fd)).unwrap();
+    expect_no_events(&mut poll, &mut events);
+}
 
 #[test]
 fn smoke() {
